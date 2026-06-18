@@ -1,6 +1,18 @@
+import copy
 from flask import Flask, request
 
 app = Flask(__name__)
+
+# Per-farmer state keyed by phone number.
+# Seeded on first contact from the shared FARMS mock data.
+FARMER_STATE = {}
+
+
+def get_farmer_farms(phone_number):
+    if phone_number not in FARMER_STATE:
+        FARMER_STATE[phone_number] = copy.deepcopy(FARMS)
+    return FARMER_STATE[phone_number]
+
 
 # Mock data sourced from BASED advisory engine output (crop_advisories_sample_2026-06-18).
 # Emoji stripped from titles — feature phones do not render unicode emoji.
@@ -314,11 +326,11 @@ def resolve_path(raw_inputs):
 # Screen renderers — advisories flow
 # ---------------------------------------------------------------------------
 
-def farm_list_screen():
+def farm_list_screen(farms):
     lines = ["CON Select your farm:"]
-    for key, farm in FARMS.items():
+    for key, farm in farms.items():
         lines.append(f"{key}. {farm['name']}")
-    add_option = len(FARMS) + 1
+    add_option = len(farms) + 1
     lines.append(f"{add_option}. Add Farm")
     return "\n".join(lines)
 
@@ -503,16 +515,19 @@ def crop_removed_screen(crop_name, farm_name):
 @app.route("/ussd", methods=["POST"])
 def ussd_callback():
     text = request.form.get("text", "")
+    phone_number = request.form.get("phoneNumber", "unknown")
     raw_inputs = text.split("*") if text else []
     inputs = resolve_path(raw_inputs)
     level = len(inputs)
 
+    farms = get_farmer_farms(phone_number)
+
     # Level 0 — home: show farm list
     if level == 0:
-        return farm_list_screen()
+        return farm_list_screen(farms)
 
     farm_key = inputs[0]
-    add_farm_option = str(len(FARMS) + 1)
+    add_farm_option = str(len(farms) + 1)
 
     # ---- Add Farm branch ---------------------------------------------------
 
@@ -529,11 +544,13 @@ def ussd_callback():
         soil = SOIL_CONDITIONS.get(soil_key)
         if not soil:
             return "END Invalid selection. Please try again."
+        new_key = str(len(farms) + 1)
+        farms[new_key] = {"name": farm_name, "gps": gps, "soil": soil, "crops": [], "advisories": []}
         return farm_added_screen(farm_name, gps, soil)
 
     # ---- Existing farm branch ----------------------------------------------
 
-    farm = FARMS.get(farm_key)
+    farm = farms.get(farm_key)
     if not farm:
         return "END Invalid selection. Please try again."
 
@@ -630,6 +647,7 @@ def ussd_callback():
                     return "END Invalid selection. Please try again."
                 action = inputs[3]
                 if action == "1":
+                    farm["crops"].remove(crop_name)
                     return crop_removed_screen(crop_name, farm["name"])
                 elif action == "2":
                     return crop_advisories_screen(farm, crop_name)
@@ -659,6 +677,8 @@ def ussd_callback():
             planted = PLANTING_DATES.get(inputs[5])
             if not planted:
                 return "END Invalid selection. Please try again."
+            if new_crop not in farm["crops"]:
+                farm["crops"].append(new_crop)
             return crop_added_screen(new_crop, farm["name"], planted)
 
         # Level 5 — advisory detail from crop-specific advisory list
