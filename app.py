@@ -1,6 +1,55 @@
+import time
+
 from flask import Flask, request
 
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# Session store (in-memory POC — no Redis)
+# ---------------------------------------------------------------------------
+# Saved on every user click, keyed by phoneNumber. Each entry stores the
+# resolved navigation path so a later dial-in can resume on the EXACT screen
+# the user left. In-memory means state is lost on server restart and is not
+# shared across worker processes — acceptable for a single-process POC.
+#
+# Schema per entry:
+#   {
+#       "path":     ["1", "2", "4"],   # resolved inputs (see resolve_path)
+#       "label":    "Add Crop",        # human-readable screen description
+#       "saved_at": 1718700000.0,      # time.time() when last saved
+#   }
+ACTIVE_SESSIONS = {}
+
+# How long a saved session remains resumable across dial-ins. Note this is NOT
+# the live USSD call timeout (network-defined, ~20-180s) — it governs whether a
+# user who hung up can pick up where they left off on a later call.
+SESSION_TTL_SECONDS = 50000
+
+
+def get_saved_session(phone):
+    """Return a non-expired saved session for this phone, or None."""
+    entry = ACTIVE_SESSIONS.get(phone)
+    if not entry:
+        return None
+    if time.time() - entry["saved_at"] > SESSION_TTL_SECONDS:
+        ACTIVE_SESSIONS.pop(phone, None)
+        return None
+    return entry
+
+
+def save_session(phone, path, label):
+    """Persist the user's current screen so they can resume later."""
+    if not phone:
+        return
+    ACTIVE_SESSIONS[phone] = {
+        "path": list(path),
+        "label": label,
+        "saved_at": time.time(),
+    }
+
+
+def clear_saved_session(phone):
+    ACTIVE_SESSIONS.pop(phone, None)
 
 # Mock data sourced from BASED advisory engine output (crop_advisories_sample_2026-06-18).
 # Emoji stripped from titles — feature phones do not render unicode emoji.
@@ -302,6 +351,33 @@ def farm_list_screen():
     return "\n".join(lines)
 
 
+def home_screen(saved, resume_key):
+    """Farm list, with a Resume option prepended when a session was saved."""
+    lines = ["CON Select your farm:"]
+    if saved:
+        lines.append(f"{resume_key}. Resume: {saved['label']}")
+    for key, farm in FARMS.items():
+        lines.append(f"{key}. {farm['name']}")
+    return "\n".join(lines)
+
+
+def describe_screen(inputs):
+    """Coarse human-readable label for the current screen, for the resume hint."""
+    farm = FARMS.get(inputs[0]) if inputs else None
+    if not farm:
+        return "your session"
+    if len(inputs) == 1:
+        return farm["name"]
+    if inputs[1] == "1":
+        return f"{farm['name']} Advisories"
+    if inputs[1] == "2":
+        add_option = str(len(farm["crops"]) + 1)
+        if len(inputs) >= 3 and inputs[2] == add_option:
+            return "Add Crop"
+        return f"{farm['name']} Crops"
+    return farm["name"]
+
+
 def farm_menu_screen(farm):
     return (
         f"CON Managing {farm['name']}:\n"
@@ -415,14 +491,53 @@ def crop_removed_screen(crop_name, farm_name):
 
 @app.route("/ussd", methods=["POST"])
 def ussd_callback():
+    """Africa's Talking entry point.
+
+    AT POSTs form-encoded `text` (full *-delimited input history) and
+    `phoneNumber`. We layer cross-dial-in resume on top of the stateless
+    replay model: a saved session is offered as an extra "Resume" option on
+    the home screen, and selecting it expands into the saved path.
+    """
     text = request.form.get("text", "")
+    phone = request.form.get("phoneNumber", "")
     raw_inputs = text.split("*") if text else []
+
+    saved = get_saved_session(phone)
+    # Resume occupies the menu slot right after the farms (farms are 1..N).
+    resume_key = str(len(FARMS) + 1)
+
+    # If the caller chose Resume, splice the saved path in front of anything
+    # they have clicked SINCE resuming. AT keeps resending the resume_key as
+    # the first token on every subsequent request, so we re-expand each time.
+    is_resume = bool(saved and raw_inputs and raw_inputs[0] == resume_key)
+    if is_resume:
+        raw_inputs = list(saved["path"]) + raw_inputs[1:]
+
     inputs = resolve_path(raw_inputs)
+
+    response = render_screen(inputs, saved, resume_key)
+
+    # Persist on continue, clear on terminate. The bare home screen (no inputs)
+    # is never saved, and we keep the saved base stable during a resumed
+    # session so the splice above stays correct across clicks.
+    if response.startswith("CON"):
+        if inputs and not is_resume:
+            save_session(phone, inputs, describe_screen(inputs))
+        elif is_resume:
+            save_session(phone, saved["path"], saved["label"])  # refresh TTL
+    else:
+        clear_saved_session(phone)
+
+    return response
+
+
+def render_screen(inputs, saved=None, resume_key=None):
+    """Pure router: resolved inputs -> CON/END string. No session side effects."""
     level = len(inputs)
 
-    # Level 0 — home: show farm list
+    # Level 0 — home: farm list (plus Resume option when a session was saved)
     if level == 0:
-        return farm_list_screen()
+        return home_screen(saved, resume_key)
 
     farm_key = inputs[0]
     farm = FARMS.get(farm_key)
