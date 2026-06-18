@@ -1,7 +1,18 @@
 # USSD Flow
 
 This document maps the complete menu tree implemented in `app.py`, derived from
-`ussd_callback()` and the screen renderer functions.
+`ussd_callback()`, `render_screen()`, and the screen renderer functions.
+
+## Request handling: wrapper + pure router
+
+The route handler is split into two layers:
+
+- **`ussd_callback()`** — thin wrapper bound to `POST /ussd`. Reads `text` and
+  `phoneNumber`, applies the **session-resume** logic (below), delegates to
+  `render_screen()`, then **saves or clears** the session based on the response.
+- **`render_screen(inputs, saved, resume_key)`** — pure function with no session
+  side effects. Maps a resolved `inputs` list to a `CON`/`END` string. This is
+  the menu tree the diagrams below describe.
 
 ## How to read this
 
@@ -28,13 +39,54 @@ This document maps the complete menu tree implemented in `app.py`, derived from
 > `add_option = str(len(crops) + 1)`. For Kiambu (3 crops) it is `4`; for Sunright
 > (2 crops) it is `3`. The same digit routes differently per farm.
 
+## Session resume (cross-dial-in)
+
+USSD is stateless within a call — `text` replays the whole input history. On top
+of that, `app.py` adds **inter-session** resume so a caller who hangs up mid-flow
+can pick up on the exact screen they left on a *later* dial-in.
+
+- **Store:** `ACTIVE_SESSIONS`, an in-memory dict keyed by `phoneNumber`. Each
+  entry holds the resolved `path`, a human-readable `label`, and `saved_at`.
+  Lost on server restart; not shared across worker processes (POC trade-off).
+- **TTL:** `SESSION_TTL_SECONDS` (default `50000`). `get_saved_session()` lazily
+  purges expired entries on access. This is **not** the live USSD call timeout
+  (network-defined, ~20–180s) — it governs how long a saved screen stays
+  resumable across calls.
+- **Save / clear:** the wrapper saves the current path on any `CON` response
+  (except the bare home screen) and clears it on any `END`.
+- **Resume key:** `resume_key = str(len(FARMS) + 1)` (currently `3`). It is the
+  menu slot after the farms. The home screen lists it **last** (display order
+  `1, 2, 3`) but the key is independent of display order — routing only checks
+  `raw_inputs[0] == resume_key`.
+- **Splice:** when the caller picks Resume, the wrapper rewrites
+  `raw_inputs = saved["path"] + raw_inputs[1:]` *before* `resolve_path()`. Africa's
+  Talking keeps resending the resume key as the first token on every subsequent
+  request, so the splice re-applies on each hop, and the saved base is re-saved
+  unchanged to keep it stable.
+
+```mermaid
+flowchart TD
+    start(["POST /ussd<br/>text, phoneNumber"]) --> lookup["saved = get_saved_session(phone)<br/>(purges if past TTL)"]
+    lookup --> isresume{"saved AND<br/>raw_inputs[0] == resume_key?"}
+    isresume -->|yes| splice["raw_inputs =<br/>saved.path + raw_inputs[1:]"]
+    isresume -->|no| asis["raw_inputs unchanged"]
+    splice --> resolve["resolve_path → inputs"]
+    asis --> resolve
+    resolve --> render["render_screen(inputs, saved, resume_key)"]
+    render --> persist{"response starts with?"}
+    persist -->|CON, level>0, not resume| save["save_session(phone, inputs, label)"]
+    persist -->|CON, is resume| refresh["save_session(phone, saved.path, saved.label)<br/>(refresh TTL, keep base)"]
+    persist -->|CON, level==0| noop["do nothing<br/>(never save bare home)"]
+    persist -->|END| clear["clear_saved_session(phone)"]
+```
+
 ## Top-level routing
 
 ```mermaid
 flowchart TD
     start(["POST /ussd"]) --> resolve["resolve_path(text.split('*'))<br/>0=back · 00=home"]
     resolve --> L0{"level == 0?"}
-    L0 -->|yes| home["CON farm_list_screen<br/>1. Kiambu Kikuy · 2. Sunright"]
+    L0 -->|yes| home["CON home_screen<br/>1. Kiambu Kikuy · 2. Sunright<br/>(+ 3. Resume if session saved)"]
     L0 -->|no| farmlookup{"FARMS.get(inputs[0])"}
     farmlookup -->|miss| invalid["END Invalid selection"]
     farmlookup -->|hit| L1{"level == 1?"}
@@ -108,4 +160,17 @@ flowchart TD
 | `1*2*1*2*1*1` | Crop #1 → its advisories → 1st advisory → steps |
 | `1*1*0` | Back from advisories list → Kiambu farm menu |
 | `1*1*3*00` | Home from advisory detail → farm list |
+
+### Resume examples
+
+These assume a session was saved on a prior dial-in (`resume_key == 3`). The
+wrapper splices the saved path in before routing.
+
+| Prior saved path | This dial's `text` | Effect |
+|------------------|--------------------|--------|
+| `["1","2","4"]` (Add Crop) | `3` | Resume → Add Crop category list |
+| `["1","2","4"]` | `3*4` | Resume, then pick Vegetables → crop list |
+| `["1","2","4"]` | `3*4*2` | Resume → Vegetables → add Tomatoes — `END`, session cleared |
+| `["1","1"]` (Advisories) | `3` | Resume → Kiambu advisories list |
+| *(none / expired)* | `3` | No Resume shown; `3` is an invalid farm → `END` |
 

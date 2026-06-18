@@ -1,0 +1,78 @@
+graph TD
+%% Custom Styling
+classDef screen fill:#ffffff,stroke:#333333,stroke-width:3px,rx:15,ry:15,color:#000000;
+classDef action fill:#d4edda,stroke:#28a745,stroke-width:2px,color:#155724;
+classDef cache fill:#cce5ff,stroke:#004085,stroke-width:2px,color:#004085;
+classDef db fill:#f8f9fa,stroke:#adb5bd,stroke-width:2px,color:#212529,stroke-dasharray: 5 5;
+classDef trigger fill:#e2e3e5,stroke:#6c757d,stroke-width:2px,color:#383d41;
+classDef external fill:#fff3cd,stroke:#ffc107,stroke-width:2px,color:#856404;
+
+    Start((Dial *384#)):::trigger --> CheckRedis
+    
+    %% --- THE REDIS CACHE PAYLOAD ---
+    RedisData[("💾 Redis Cache (JSON)<br>======================<br>Key: ussd_state:+254...<br>farm_id: '104'<br>action_type: 'add_crop'<br>crop_selected: 'Tomatoes'<br>next_screen: 'date_picker'<br>ttl_seconds: 86400")]:::db
+
+    %% --- INITIAL BACKEND CHECK ---
+    CheckRedis{Backend Checks<br>Redis Cache}:::cache
+    CheckRedis -. "Reads payload" .-> RedisData
+    
+    %% PATH A: NO RECENT SESSION
+    CheckRedis -- "No active state" --> FarmSelect
+    FarmSelect["📱 Select Farm<br>==============<br>1. Kiambu Plot<br>2. Thika Plot<br>3. Add New Farm<br>0. Exit"]:::screen
+    
+    %% PATH B: RESUME SESSION FOUND
+    CheckRedis -- "Found State" --> DynamicFarm
+    DynamicFarm["📱 Select Farm<br>==============<br>1. Resume: Add Tomatoes<br>2. Kiambu Plot<br>3. Thika Plot<br>0. Exit"]:::screen
+    
+    %% --- ROUTING & CACHE MANAGEMENT ---
+    DynamicFarm -- "Reply: 1" --> RestoreState{"Backend Restores<br>Saved Screen"}:::cache
+    RestoreState --> AddDate
+    
+    DynamicFarm -- "Reply: 2" --> ClearCache{"Clear Redis State"}:::cache
+    ClearCache -. "REDIS.DELETE" .-> RedisData
+    ClearCache --> Menu
+    
+    FarmSelect -- "Reply: 1" --> SaveStateMenu{"Save State to Redis<br>(TTL: 24h)"}:::cache
+    SaveStateMenu -. "Overwrites payload" .-> RedisData
+    SaveStateMenu --> Menu
+
+    %% --- MAIN MENU ---
+    Menu["📱 Kiambu Plot<br>==============<br>1. View Alerts<br>2. Add Crop<br>3. Remove Crop<br>4. Feedback<br>0. Back"]:::screen
+    
+    %% --- VIEW ALERTS PATH ---
+    Menu -- "Reply: 1" --> AlertsIndex
+    AlertsIndex["📱 Kiambu Alerts<br>==============<br>1. CRITICAL (1)<br>2. HIGH (0)<br>0. Back"]:::screen
+    
+    AlertsIndex -- "Reply: 1" --> CritList
+    CritList["📱 CRITICAL<br>==============<br>1. Tomato Disease<br>0. Back"]:::screen
+    
+    CritList -- "Reply: 1" --> AlertDetail
+    AlertDetail["📱 Tomatoes (2d)<br>==============<br>Late blight risk. Spray<br>Dithane AM. Wait 3d<br>to harvest.<br>1. Send as full SMS<br>0. Back"]:::screen
+    
+    %% --- THE ASYNC SMS TRIGGER FLOW ---
+    AlertDetail -- "Reply: 1" --> CloseSession([System: Show END Screen<br>Connection Dropped]):::action
+    AlertDetail -. "Backend fires Async Task" .-> CeleryQueue
+    
+    CeleryQueue{"Celery Task Queue<br>(Runs via Redis)"}:::cache
+    CeleryQueue -. "Worker Processes Task" .-> AfricaTalking
+    
+    AfricaTalking["Africa's Talking<br>SMS Gateway API"]:::external
+    AfricaTalking -- "Delivers 320-char SMS<br>(Concatenated)" --> FarmerInbox((Farmer's<br>SMS Inbox)):::trigger
+
+    %% --- ADD CROP PATH ---
+    Menu -- "Reply: 2" --> AddCat
+    AddCat["📱 Categories<br>==============<br>1. Cereals<br>2. Vegetables<br>3. Legumes<br>0. Back"]:::screen
+    
+    AddCat -- "Reply: 2" --> AddCrop
+    AddCrop["📱 Vegetables<br>==============<br>1. Tomatoes<br>2. Onions<br>0. Back"]:::screen
+    
+    AddCrop -- "Reply: 1" --> AddDate
+    AddDate["📱 Planted When?<br>==============<br>1. Today<br>2. Yesterday<br>3. 1 Week Ago<br>0. Back"]:::screen
+    
+    AddDate -- "Reply: 3" --> SaveCrop([System: Crop Added<br>Session END]):::action
+
+    %% --- FEEDBACK PATH ---
+    Menu -- "Reply: 4" --> FeedMenu
+    FeedMenu["📱 Feedback<br>==============<br>Was recent advice helpful?<br>1. Yes<br>2. No<br>3. Call me<br>0. Back"]:::screen
+
+    FeedMenu -- "Reply: 1, 2, or 3" --> LogFeedback([System: Feedback Logged<br>Session END]):::action
