@@ -267,6 +267,15 @@ CROP_CATEGORIES = {
     },
 }
 
+SOIL_CONDITIONS = {
+    "1": "Clay",
+    "2": "Loamy",
+    "3": "Sandy",
+    "4": "Silt",
+    "5": "Peaty",
+    "6": "Chalky",
+}
+
 SEVERITY_TAG = {
     "CRITICAL": "[CRIT]",
     "HIGH": "[HIGH]",
@@ -309,7 +318,33 @@ def farm_list_screen():
     lines = ["CON Select your farm:"]
     for key, farm in FARMS.items():
         lines.append(f"{key}. {farm['name']}")
+    add_option = len(FARMS) + 1
+    lines.append(f"{add_option}. Add Farm")
     return "\n".join(lines)
+
+
+def add_farm_name_screen():
+    return "CON Enter farm name:"
+
+
+def add_farm_gps_screen(farm_name):
+    return f"CON {farm_name}\nEnter GPS coordinates:\n(e.g. -1.2921,36.8219)"
+
+
+def add_farm_soil_screen(farm_name):
+    lines = [f"CON {farm_name}\nSelect soil condition:"]
+    for key, soil in SOIL_CONDITIONS.items():
+        lines.append(f"{key}. {soil}")
+    lines.append("0. Back  00. Home")
+    return "\n".join(lines)
+
+
+def farm_added_screen(farm_name, gps, soil):
+    return (
+        f"END {farm_name} has been added! "
+        f"GPS: {gps}. Soil: {soil}. "
+        f"You can now add crops and receive advisories for this farm."
+    )
 
 
 def farm_menu_screen(farm):
@@ -429,9 +464,28 @@ def add_crop_select_screen(category):
     return "\n".join(lines)
 
 
-def crop_added_screen(crop_name, farm_name):
+PLANTING_DATES = {
+    "1": "0 days ago",
+    "2": "1 day ago",
+    "3": "3 days ago",
+    "4": "7 days ago",
+    "5": "14 days ago",
+    "6": "30 days ago",
+}
+
+
+def planting_date_screen(crop_name):
+    lines = [f"CON When did you plant {crop_name}?"]
+    for key, label in PLANTING_DATES.items():
+        lines.append(f"{key}. {label.capitalize()}")
+    lines.append("0. Back  00. Home")
+    return "\n".join(lines)
+
+
+def crop_added_screen(crop_name, farm_name, planted):
     return (
         f"END {crop_name} has been added to {farm_name}! "
+        f"Planted: {planted}. "
         f"You will now receive advisories for this crop."
     )
 
@@ -458,6 +512,27 @@ def ussd_callback():
         return farm_list_screen()
 
     farm_key = inputs[0]
+    add_farm_option = str(len(FARMS) + 1)
+
+    # ---- Add Farm branch ---------------------------------------------------
+
+    if farm_key == add_farm_option:
+        if level == 1:
+            return add_farm_name_screen()
+        farm_name = inputs[1]
+        if level == 2:
+            return add_farm_gps_screen(farm_name)
+        gps = inputs[2]
+        if level == 3:
+            return add_farm_soil_screen(farm_name)
+        soil_key = inputs[3]
+        soil = SOIL_CONDITIONS.get(soil_key)
+        if not soil:
+            return "END Invalid selection. Please try again."
+        return farm_added_screen(farm_name, gps, soil)
+
+    # ---- Existing farm branch ----------------------------------------------
+
     farm = FARMS.get(farm_key)
     if not farm:
         return "END Invalid selection. Please try again."
@@ -561,7 +636,7 @@ def ussd_callback():
                 else:
                     return "END Invalid option. Please try again."
 
-        # Level 5 — specific crop selected from category to add
+        # Level 5 — specific crop selected from category: ask planting date
         if level == 5 and crop_choice == add_option:
             cat = CROP_CATEGORIES.get(inputs[3])
             if not cat:
@@ -570,7 +645,21 @@ def ussd_callback():
                 new_crop = cat["crops"][int(inputs[4]) - 1]
             except (ValueError, IndexError):
                 return "END Invalid selection. Please try again."
-            return crop_added_screen(new_crop, farm["name"])
+            return planting_date_screen(new_crop)
+
+        # Level 6 — planting date selected: confirm crop added
+        if level == 6 and crop_choice == add_option:
+            cat = CROP_CATEGORIES.get(inputs[3])
+            if not cat:
+                return "END Invalid category. Please try again."
+            try:
+                new_crop = cat["crops"][int(inputs[4]) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            planted = PLANTING_DATES.get(inputs[5])
+            if not planted:
+                return "END Invalid selection. Please try again."
+            return crop_added_screen(new_crop, farm["name"], planted)
 
         # Level 5 — advisory detail from crop-specific advisory list
         if level == 5 and inputs[3] == "2":
