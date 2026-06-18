@@ -1,17 +1,46 @@
 import copy
+import time
+
 from flask import Flask, request
 
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# Session store (in-memory POC — no Redis)
+# ---------------------------------------------------------------------------
+ACTIVE_SESSIONS = {}
+SESSION_TTL_SECONDS = 50000
+
+
+def get_saved_session(phone):
+    entry = ACTIVE_SESSIONS.get(phone)
+    if not entry:
+        return None
+    if time.time() - entry["saved_at"] > SESSION_TTL_SECONDS:
+        ACTIVE_SESSIONS.pop(phone, None)
+        return None
+    return entry
+
+
+def save_session(phone, path, label):
+    if not phone:
+        return
+    ACTIVE_SESSIONS[phone] = {"path": list(path), "label": label, "saved_at": time.time()}
+
+
+def clear_saved_session(phone):
+    ACTIVE_SESSIONS.pop(phone, None)
+
 
 # Per-farmer state keyed by phone number.
 # Seeded on first contact from the shared FARMS mock data.
 FARMER_STATE = {}
 
 
-def get_farmer_farms(phone_number):
-    if phone_number not in FARMER_STATE:
-        FARMER_STATE[phone_number] = copy.deepcopy(FARMS)
-    return FARMER_STATE[phone_number]
+def get_farmer_farms(phone):
+    if phone not in FARMER_STATE:
+        FARMER_STATE[phone] = copy.deepcopy(FARMS)
+    return FARMER_STATE[phone]
 
 
 # Mock data sourced from BASED advisory engine output (crop_advisories_sample_2026-06-18).
@@ -326,13 +355,33 @@ def resolve_path(raw_inputs):
 # Screen renderers — advisories flow
 # ---------------------------------------------------------------------------
 
-def farm_list_screen(farms):
+def home_screen(farms, saved, resume_key):
+    """Farm list with Add Farm and optional Resume appended."""
     lines = ["CON Select your farm:"]
     for key, farm in farms.items():
         lines.append(f"{key}. {farm['name']}")
     add_option = len(farms) + 1
     lines.append(f"{add_option}. Add Farm")
+    if saved:
+        lines.append(f"{resume_key}. Resume: {saved['label']}")
     return "\n".join(lines)
+
+
+def describe_screen(inputs, farms):
+    """Coarse human-readable label for the current screen, for the resume hint."""
+    farm = farms.get(inputs[0]) if inputs else None
+    if not farm:
+        return "your session"
+    if len(inputs) == 1:
+        return farm["name"]
+    if inputs[1] == "1":
+        return f"{farm['name']} Advisories"
+    if inputs[1] == "2":
+        add_option = str(len(farm["crops"]) + 1)
+        if len(inputs) >= 3 and inputs[2] == add_option:
+            return "Add Crop"
+        return f"{farm['name']} Crops"
+    return farm["name"]
 
 
 def add_farm_name_screen():
@@ -515,16 +564,38 @@ def crop_removed_screen(crop_name, farm_name):
 @app.route("/ussd", methods=["POST"])
 def ussd_callback():
     text = request.form.get("text", "")
-    phone_number = request.form.get("phoneNumber", "unknown")
+    phone = request.form.get("phoneNumber", "unknown")
     raw_inputs = text.split("*") if text else []
+
+    farms = get_farmer_farms(phone)
+    saved = get_saved_session(phone)
+    resume_key = str(len(farms) + 2)
+
+    is_resume = bool(saved and raw_inputs and raw_inputs[0] == resume_key)
+    if is_resume:
+        raw_inputs = list(saved["path"]) + raw_inputs[1:]
+
     inputs = resolve_path(raw_inputs)
+    response = render_screen(inputs, farms, saved, resume_key)
+
+    if response.startswith("CON"):
+        if inputs and not is_resume:
+            save_session(phone, inputs, describe_screen(inputs, farms))
+        elif is_resume:
+            save_session(phone, saved["path"], saved["label"])
+    else:
+        clear_saved_session(phone)
+
+    return response
+
+
+def render_screen(inputs, farms, saved=None, resume_key=None):
+    """Pure router: resolved inputs -> CON/END string. No session side effects."""
     level = len(inputs)
 
-    farms = get_farmer_farms(phone_number)
-
-    # Level 0 — home: show farm list
+    # Level 0 — home: farm list with Add Farm and optional Resume
     if level == 0:
-        return farm_list_screen(farms)
+        return home_screen(farms, saved, resume_key)
 
     farm_key = inputs[0]
     add_farm_option = str(len(farms) + 1)
