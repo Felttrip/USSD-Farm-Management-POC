@@ -352,12 +352,16 @@ def farm_list_screen():
 
 
 def home_screen(saved, resume_key):
-    """Farm list, with a Resume option prepended when a session was saved."""
+    """Farm list, with a Resume option appended when a session was saved.
+
+    Resume is listed last so the displayed order matches the numbering
+    (farms are 1..N, Resume is N+1) — feature-phone users scan top-to-bottom.
+    """
     lines = ["CON Select your farm:"]
-    if saved:
-        lines.append(f"{resume_key}. Resume: {saved['label']}")
     for key, farm in FARMS.items():
         lines.append(f"{key}. {farm['name']}")
+    if saved:
+        lines.append(f"{resume_key}. Resume: {saved['label']}")
     return "\n".join(lines)
 
 
