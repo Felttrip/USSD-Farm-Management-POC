@@ -1,5 +1,16 @@
 import copy
+import os
+import africastalking
 from flask import Flask, request
+from dotenv import load_dotenv
+
+load_dotenv()
+
+AT_USERNAME = os.getenv("AT_USERNAME")
+AT_API_KEY = os.getenv("AT_API_KEY")
+print(f"[CONFIG] AT_USERNAME={AT_USERNAME!r}  AT_API_KEY={AT_API_KEY[:8] + '...' if AT_API_KEY else None!r}")
+
+africastalking.initialize(AT_USERNAME, AT_API_KEY)
 
 app = Flask(__name__)
 
@@ -388,7 +399,8 @@ def advisory_detail_screen(adv):
         f"CON {tag} {adv['crop']} - {adv['title']}\n"
         f"{desc}\n"
         f"1. See action steps\n"
-        f"2. Rate this advisory"
+        f"2. Rate this advisory\n"
+        f"3. Send to SMS"
         f"{NAV}"
     )
 
@@ -422,6 +434,24 @@ def feedback_received_screen(adv):
         f"{tag} {adv['crop']} - {adv['title'][:30]}"
         f"{NAV}"
     )
+
+
+def sms_sent_screen(phone_number):
+    return (
+        f"CON Advisory sent to {phone_number}."
+        f"{NAV}"
+    )
+
+
+def send_advisory_sms(phone_number, adv):
+    steps = "\n".join(f"{i}. {s}" for i, s in enumerate(adv["steps"], 1))
+    body = (
+        f"{adv['crop']} - {adv['title']}\n"
+        f"{adv['description']}\n\n"
+        f"Steps:\n{steps}\n"
+        f"Valid: {adv['valid_days']} days"
+    )
+    africastalking.SMS.send(body, [phone_number])
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +619,14 @@ def ussd_callback():
                 return "END Invalid selection. Please try again."
             return rate_advisory_screen(adv)
 
+        if level == 4 and inputs[3] == "3":
+            try:
+                adv = farm["advisories"][int(inputs[2]) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            send_advisory_sms(phone_number, adv)
+            return sms_sent_screen(phone_number)
+
         # Level 5 — feedback from detail rate screen (Path A)
         if level == 5 and inputs[3] == "2" and inputs[4] in ("1", "2"):
             try:
@@ -718,6 +756,19 @@ def ussd_callback():
             except (ValueError, IndexError):
                 return "END Invalid selection. Please try again."
             return rate_advisory_screen(adv)
+
+        if level == 6 and inputs[3] == "2" and inputs[5] == "3":
+            try:
+                crop_name = crops[int(crop_choice) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            matching = [a for a in farm["advisories"] if a["crop"] == crop_name]
+            try:
+                adv = matching[int(inputs[4]) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            send_advisory_sms(phone_number, adv)
+            return sms_sent_screen(phone_number)
 
         # Level 7 — feedback from detail rate screen (Path B)
         if level == 7 and inputs[3] == "2" and inputs[5] == "2" and inputs[6] in ("1", "2"):
