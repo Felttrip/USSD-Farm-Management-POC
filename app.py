@@ -1,3 +1,4 @@
+import copy
 import time
 
 from flask import Flask, request
@@ -7,27 +8,11 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 # Session store (in-memory POC — no Redis)
 # ---------------------------------------------------------------------------
-# Saved on every user click, keyed by phoneNumber. Each entry stores the
-# resolved navigation path so a later dial-in can resume on the EXACT screen
-# the user left. In-memory means state is lost on server restart and is not
-# shared across worker processes — acceptable for a single-process POC.
-#
-# Schema per entry:
-#   {
-#       "path":     ["1", "2", "4"],   # resolved inputs (see resolve_path)
-#       "label":    "Add Crop",        # human-readable screen description
-#       "saved_at": 1718700000.0,      # time.time() when last saved
-#   }
 ACTIVE_SESSIONS = {}
-
-# How long a saved session remains resumable across dial-ins. Note this is NOT
-# the live USSD call timeout (network-defined, ~20-180s) — it governs whether a
-# user who hung up can pick up where they left off on a later call.
 SESSION_TTL_SECONDS = 50000
 
 
 def get_saved_session(phone):
-    """Return a non-expired saved session for this phone, or None."""
     entry = ACTIVE_SESSIONS.get(phone)
     if not entry:
         return None
@@ -38,18 +23,25 @@ def get_saved_session(phone):
 
 
 def save_session(phone, path, label):
-    """Persist the user's current screen so they can resume later."""
     if not phone:
         return
-    ACTIVE_SESSIONS[phone] = {
-        "path": list(path),
-        "label": label,
-        "saved_at": time.time(),
-    }
+    ACTIVE_SESSIONS[phone] = {"path": list(path), "label": label, "saved_at": time.time()}
 
 
 def clear_saved_session(phone):
     ACTIVE_SESSIONS.pop(phone, None)
+
+
+# Per-farmer state keyed by phone number.
+# Seeded on first contact from the shared FARMS mock data.
+FARMER_STATE = {}
+
+
+def get_farmer_farms(phone):
+    if phone not in FARMER_STATE:
+        FARMER_STATE[phone] = copy.deepcopy(FARMS)
+    return FARMER_STATE[phone]
+
 
 # Mock data sourced from BASED advisory engine output (crop_advisories_sample_2026-06-18).
 # Emoji stripped from titles — feature phones do not render unicode emoji.
@@ -316,6 +308,15 @@ CROP_CATEGORIES = {
     },
 }
 
+SOIL_CONDITIONS = {
+    "1": "Clay",
+    "2": "Loamy",
+    "3": "Sandy",
+    "4": "Silt",
+    "5": "Peaty",
+    "6": "Chalky",
+}
+
 SEVERITY_TAG = {
     "CRITICAL": "[CRIT]",
     "HIGH": "[HIGH]",
@@ -324,6 +325,16 @@ SEVERITY_TAG = {
 }
 
 NAV = "\n0. Back  00. Home"
+
+FEEDBACK = []
+
+
+def store_feedback(farm_key, adv_index, rating_input, source):
+    rating = "good" if rating_input == "1" else "not_good"
+    entry = {"farm": farm_key, "adv_index": adv_index, "rating": rating, "source": source}
+    FEEDBACK.append(entry)
+    print(f"[FEEDBACK] {entry}")
+    return rating
 
 
 def resolve_path(raw_inputs):
@@ -344,30 +355,21 @@ def resolve_path(raw_inputs):
 # Screen renderers — advisories flow
 # ---------------------------------------------------------------------------
 
-def farm_list_screen():
+def home_screen(farms, saved, resume_key):
+    """Farm list with Add Farm and optional Resume appended."""
     lines = ["CON Select your farm:"]
-    for key, farm in FARMS.items():
+    for key, farm in farms.items():
         lines.append(f"{key}. {farm['name']}")
-    return "\n".join(lines)
-
-
-def home_screen(saved, resume_key):
-    """Farm list, with a Resume option appended when a session was saved.
-
-    Resume is listed last so the displayed order matches the numbering
-    (farms are 1..N, Resume is N+1) — feature-phone users scan top-to-bottom.
-    """
-    lines = ["CON Select your farm:"]
-    for key, farm in FARMS.items():
-        lines.append(f"{key}. {farm['name']}")
+    add_option = len(farms) + 1
+    lines.append(f"{add_option}. Add Farm")
     if saved:
         lines.append(f"{resume_key}. Resume: {saved['label']}")
     return "\n".join(lines)
 
 
-def describe_screen(inputs):
+def describe_screen(inputs, farms):
     """Coarse human-readable label for the current screen, for the resume hint."""
-    farm = FARMS.get(inputs[0]) if inputs else None
+    farm = farms.get(inputs[0]) if inputs else None
     if not farm:
         return "your session"
     if len(inputs) == 1:
@@ -382,11 +384,36 @@ def describe_screen(inputs):
     return farm["name"]
 
 
+def add_farm_name_screen():
+    return "CON Enter farm name:"
+
+
+def add_farm_gps_screen(farm_name):
+    return f"CON {farm_name}\nEnter GPS coordinates:\n(e.g. -1.2921,36.8219)"
+
+
+def add_farm_soil_screen(farm_name):
+    lines = [f"CON {farm_name}\nSelect soil condition:"]
+    for key, soil in SOIL_CONDITIONS.items():
+        lines.append(f"{key}. {soil}")
+    lines.append("0. Back  00. Home")
+    return "\n".join(lines)
+
+
+def farm_added_screen(farm_name, gps, soil):
+    return (
+        f"END {farm_name} has been added! "
+        f"GPS: {gps}. Soil: {soil}. "
+        f"You can now add crops and receive advisories for this farm."
+    )
+
+
 def farm_menu_screen(farm):
     return (
         f"CON Managing {farm['name']}:\n"
         f"1. See Advisories\n"
-        f"2. Manage Crops"
+        f"2. Manage Crops\n"
+        f"3. Rate Past Advisories"
         f"{NAV}"
     )
 
@@ -409,7 +436,8 @@ def advisory_detail_screen(adv):
     return (
         f"CON {tag} {adv['crop']} - {adv['title']}\n"
         f"{desc}\n"
-        f"1. See action steps"
+        f"1. See action steps\n"
+        f"2. Rate this advisory"
         f"{NAV}"
     )
 
@@ -419,7 +447,28 @@ def advisory_steps_screen(adv):
     return (
         f"CON {adv['crop']} - Actions:\n"
         f"{steps}\n"
-        f"Valid: {adv['valid_days']} days"
+        f"Valid: {adv['valid_days']} days\n"
+        f"Rate: 1-Good  2-Not good"
+        f"{NAV}"
+    )
+
+
+def rate_advisory_screen(adv):
+    tag = SEVERITY_TAG.get(adv["severity"], "")
+    return (
+        f"CON {tag} {adv['crop']} - {adv['title'][:30]}\n"
+        f"Rate this advisory:\n"
+        f"1. Good advice\n"
+        f"2. Not good advice"
+        f"{NAV}"
+    )
+
+
+def feedback_received_screen(adv):
+    tag = SEVERITY_TAG.get(adv["severity"], "")
+    return (
+        f"CON Thank you! Feedback recorded for:\n"
+        f"{tag} {adv['crop']} - {adv['title'][:30]}"
         f"{NAV}"
     )
 
@@ -476,9 +525,28 @@ def add_crop_select_screen(category):
     return "\n".join(lines)
 
 
-def crop_added_screen(crop_name, farm_name):
+PLANTING_DATES = {
+    "1": "0 days ago",
+    "2": "1 day ago",
+    "3": "3 days ago",
+    "4": "7 days ago",
+    "5": "14 days ago",
+    "6": "30 days ago",
+}
+
+
+def planting_date_screen(crop_name):
+    lines = [f"CON When did you plant {crop_name}?"]
+    for key, label in PLANTING_DATES.items():
+        lines.append(f"{key}. {label.capitalize()}")
+    lines.append("0. Back  00. Home")
+    return "\n".join(lines)
+
+
+def crop_added_screen(crop_name, farm_name, planted):
     return (
         f"END {crop_name} has been added to {farm_name}! "
+        f"Planted: {planted}. "
         f"You will now receive advisories for this crop."
     )
 
@@ -495,56 +563,65 @@ def crop_removed_screen(crop_name, farm_name):
 
 @app.route("/ussd", methods=["POST"])
 def ussd_callback():
-    """Africa's Talking entry point.
-
-    AT POSTs form-encoded `text` (full *-delimited input history) and
-    `phoneNumber`. We layer cross-dial-in resume on top of the stateless
-    replay model: a saved session is offered as an extra "Resume" option on
-    the home screen, and selecting it expands into the saved path.
-    """
     text = request.form.get("text", "")
-    phone = request.form.get("phoneNumber", "")
+    phone = request.form.get("phoneNumber", "unknown")
     raw_inputs = text.split("*") if text else []
 
+    farms = get_farmer_farms(phone)
     saved = get_saved_session(phone)
-    # Resume occupies the menu slot right after the farms (farms are 1..N).
-    resume_key = str(len(FARMS) + 1)
+    resume_key = str(len(farms) + 2)
 
-    # If the caller chose Resume, splice the saved path in front of anything
-    # they have clicked SINCE resuming. AT keeps resending the resume_key as
-    # the first token on every subsequent request, so we re-expand each time.
     is_resume = bool(saved and raw_inputs and raw_inputs[0] == resume_key)
     if is_resume:
         raw_inputs = list(saved["path"]) + raw_inputs[1:]
 
     inputs = resolve_path(raw_inputs)
+    response = render_screen(inputs, farms, saved, resume_key)
 
-    response = render_screen(inputs, saved, resume_key)
-
-    # Persist on continue, clear on terminate. The bare home screen (no inputs)
-    # is never saved, and we keep the saved base stable during a resumed
-    # session so the splice above stays correct across clicks.
     if response.startswith("CON"):
         if inputs and not is_resume:
-            save_session(phone, inputs, describe_screen(inputs))
+            save_session(phone, inputs, describe_screen(inputs, farms))
         elif is_resume:
-            save_session(phone, saved["path"], saved["label"])  # refresh TTL
+            save_session(phone, saved["path"], saved["label"])
     else:
         clear_saved_session(phone)
 
     return response
 
 
-def render_screen(inputs, saved=None, resume_key=None):
+def render_screen(inputs, farms, saved=None, resume_key=None):
     """Pure router: resolved inputs -> CON/END string. No session side effects."""
     level = len(inputs)
 
-    # Level 0 — home: farm list (plus Resume option when a session was saved)
+    # Level 0 — home: farm list with Add Farm and optional Resume
     if level == 0:
-        return home_screen(saved, resume_key)
+        return home_screen(farms, saved, resume_key)
 
     farm_key = inputs[0]
-    farm = FARMS.get(farm_key)
+    add_farm_option = str(len(farms) + 1)
+
+    # ---- Add Farm branch ---------------------------------------------------
+
+    if farm_key == add_farm_option:
+        if level == 1:
+            return add_farm_name_screen()
+        farm_name = inputs[1]
+        if level == 2:
+            return add_farm_gps_screen(farm_name)
+        gps = inputs[2]
+        if level == 3:
+            return add_farm_soil_screen(farm_name)
+        soil_key = inputs[3]
+        soil = SOIL_CONDITIONS.get(soil_key)
+        if not soil:
+            return "END Invalid selection. Please try again."
+        new_key = str(len(farms) + 1)
+        farms[new_key] = {"name": farm_name, "gps": gps, "soil": soil, "crops": [], "advisories": []}
+        return farm_added_screen(farm_name, gps, soil)
+
+    # ---- Existing farm branch ----------------------------------------------
+
+    farm = farms.get(farm_key)
     if not farm:
         return "END Invalid selection. Please try again."
 
@@ -568,13 +645,40 @@ def render_screen(inputs, saved=None, resume_key=None):
                 return "END Invalid selection. Please try again."
             return advisory_detail_screen(adv)
 
-        # Level 4 — action steps from all-advisories detail
+        # Level 4 — action steps or rate screen from all-advisories detail
         if level == 4 and inputs[3] == "1":
             try:
                 adv = farm["advisories"][int(inputs[2]) - 1]
             except (ValueError, IndexError):
                 return "END Invalid selection. Please try again."
             return advisory_steps_screen(adv)
+
+        if level == 4 and inputs[3] == "2":
+            try:
+                adv = farm["advisories"][int(inputs[2]) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            return rate_advisory_screen(adv)
+
+        # Level 5 — feedback from detail rate screen (Path A)
+        if level == 5 and inputs[3] == "2" and inputs[4] in ("1", "2"):
+            try:
+                adv_index = int(inputs[2]) - 1
+                adv = farm["advisories"][adv_index]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            store_feedback(farm_key, adv_index, inputs[4], "immediate")
+            return feedback_received_screen(adv)
+
+        # Level 5 — immediate feedback from all-advisories action steps
+        if level == 5 and inputs[3] == "1" and inputs[4] in ("1", "2"):
+            try:
+                adv_index = int(inputs[2]) - 1
+                adv = farm["advisories"][adv_index]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            store_feedback(farm_key, adv_index, inputs[4], "immediate")
+            return feedback_received_screen(adv)
 
     # ---- Manage Crops branch (menu_choice == "2") --------------------------
 
@@ -614,13 +718,14 @@ def render_screen(inputs, saved=None, resume_key=None):
                     return "END Invalid selection. Please try again."
                 action = inputs[3]
                 if action == "1":
+                    farm["crops"].remove(crop_name)
                     return crop_removed_screen(crop_name, farm["name"])
                 elif action == "2":
                     return crop_advisories_screen(farm, crop_name)
                 else:
                     return "END Invalid option. Please try again."
 
-        # Level 5 — specific crop selected from category to add
+        # Level 5 — specific crop selected from category: ask planting date
         if level == 5 and crop_choice == add_option:
             cat = CROP_CATEGORIES.get(inputs[3])
             if not cat:
@@ -629,7 +734,23 @@ def render_screen(inputs, saved=None, resume_key=None):
                 new_crop = cat["crops"][int(inputs[4]) - 1]
             except (ValueError, IndexError):
                 return "END Invalid selection. Please try again."
-            return crop_added_screen(new_crop, farm["name"])
+            return planting_date_screen(new_crop)
+
+        # Level 6 — planting date selected: confirm crop added
+        if level == 6 and crop_choice == add_option:
+            cat = CROP_CATEGORIES.get(inputs[3])
+            if not cat:
+                return "END Invalid category. Please try again."
+            try:
+                new_crop = cat["crops"][int(inputs[4]) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            planted = PLANTING_DATES.get(inputs[5])
+            if not planted:
+                return "END Invalid selection. Please try again."
+            if new_crop not in farm["crops"]:
+                farm["crops"].append(new_crop)
+            return crop_added_screen(new_crop, farm["name"], planted)
 
         # Level 5 — advisory detail from crop-specific advisory list
         if level == 5 and inputs[3] == "2":
@@ -644,7 +765,7 @@ def render_screen(inputs, saved=None, resume_key=None):
                 return "END Invalid selection. Please try again."
             return advisory_detail_screen(adv)
 
-        # Level 6 — action steps from crop-specific advisory detail
+        # Level 6 — action steps or rate screen from crop-specific advisory detail
         if level == 6 and inputs[3] == "2" and inputs[5] == "1":
             try:
                 crop_name = crops[int(crop_choice) - 1]
@@ -656,6 +777,75 @@ def render_screen(inputs, saved=None, resume_key=None):
             except (ValueError, IndexError):
                 return "END Invalid selection. Please try again."
             return advisory_steps_screen(adv)
+
+        if level == 6 and inputs[3] == "2" and inputs[5] == "2":
+            try:
+                crop_name = crops[int(crop_choice) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            matching = [a for a in farm["advisories"] if a["crop"] == crop_name]
+            try:
+                adv = matching[int(inputs[4]) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            return rate_advisory_screen(adv)
+
+        # Level 7 — feedback from detail rate screen (Path B)
+        if level == 7 and inputs[3] == "2" and inputs[5] == "2" and inputs[6] in ("1", "2"):
+            try:
+                crop_name = crops[int(crop_choice) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            matching = [a for a in farm["advisories"] if a["crop"] == crop_name]
+            try:
+                adv_index_in_matching = int(inputs[4]) - 1
+                adv = matching[adv_index_in_matching]
+                adv_index = farm["advisories"].index(adv)
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            store_feedback(farm_key, adv_index, inputs[6], "immediate")
+            return feedback_received_screen(adv)
+
+        # Level 7 — immediate feedback from crop-specific advisory action steps
+        if level == 7 and inputs[3] == "2" and inputs[5] == "1" and inputs[6] in ("1", "2"):
+            try:
+                crop_name = crops[int(crop_choice) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            matching = [a for a in farm["advisories"] if a["crop"] == crop_name]
+            try:
+                adv_index_in_matching = int(inputs[4]) - 1
+                adv = matching[adv_index_in_matching]
+                adv_index = farm["advisories"].index(adv)
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            store_feedback(farm_key, adv_index, inputs[6], "immediate")
+            return feedback_received_screen(adv)
+
+    # ---- Rate Past Advisories branch (menu_choice == "3") ------------------
+
+    elif menu_choice == "3":
+        # Level 2 — list all advisories to rate
+        if level == 2:
+            return advisories_list_screen(farm)
+
+        # Level 3 — show rating screen for selected advisory
+        if level == 3:
+            try:
+                adv = farm["advisories"][int(inputs[2]) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            return rate_advisory_screen(adv)
+
+        # Level 4 — record past feedback
+        if level == 4 and inputs[3] in ("1", "2"):
+            try:
+                adv_index = int(inputs[2]) - 1
+                adv = farm["advisories"][adv_index]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            store_feedback(farm_key, adv_index, inputs[3], "past")
+            return feedback_received_screen(adv)
 
     return "END Invalid option. Please try again."
 
