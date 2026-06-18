@@ -276,6 +276,16 @@ SEVERITY_TAG = {
 
 NAV = "\n0. Back  00. Home"
 
+FEEDBACK = []
+
+
+def store_feedback(farm_key, adv_index, rating_input, source):
+    rating = "good" if rating_input == "1" else "not_good"
+    entry = {"farm": farm_key, "adv_index": adv_index, "rating": rating, "source": source}
+    FEEDBACK.append(entry)
+    print(f"[FEEDBACK] {entry}")
+    return rating
+
 
 def resolve_path(raw_inputs):
     """Replay inputs, treating 0 as back and 00 as go-to-home."""
@@ -306,7 +316,8 @@ def farm_menu_screen(farm):
     return (
         f"CON Managing {farm['name']}:\n"
         f"1. See Advisories\n"
-        f"2. Manage Crops"
+        f"2. Manage Crops\n"
+        f"3. Rate Past Advisories"
         f"{NAV}"
     )
 
@@ -329,7 +340,8 @@ def advisory_detail_screen(adv):
     return (
         f"CON {tag} {adv['crop']} - {adv['title']}\n"
         f"{desc}\n"
-        f"1. See action steps"
+        f"1. See action steps\n"
+        f"2. Rate this advisory"
         f"{NAV}"
     )
 
@@ -339,7 +351,28 @@ def advisory_steps_screen(adv):
     return (
         f"CON {adv['crop']} - Actions:\n"
         f"{steps}\n"
-        f"Valid: {adv['valid_days']} days"
+        f"Valid: {adv['valid_days']} days\n"
+        f"Rate: 1-Good  2-Not good"
+        f"{NAV}"
+    )
+
+
+def rate_advisory_screen(adv):
+    tag = SEVERITY_TAG.get(adv["severity"], "")
+    return (
+        f"CON {tag} {adv['crop']} - {adv['title'][:30]}\n"
+        f"Rate this advisory:\n"
+        f"1. Good advice\n"
+        f"2. Not good advice"
+        f"{NAV}"
+    )
+
+
+def feedback_received_screen(adv):
+    tag = SEVERITY_TAG.get(adv["severity"], "")
+    return (
+        f"CON Thank you! Feedback recorded for:\n"
+        f"{tag} {adv['crop']} - {adv['title'][:30]}"
         f"{NAV}"
     )
 
@@ -449,13 +482,40 @@ def ussd_callback():
                 return "END Invalid selection. Please try again."
             return advisory_detail_screen(adv)
 
-        # Level 4 — action steps from all-advisories detail
+        # Level 4 — action steps or rate screen from all-advisories detail
         if level == 4 and inputs[3] == "1":
             try:
                 adv = farm["advisories"][int(inputs[2]) - 1]
             except (ValueError, IndexError):
                 return "END Invalid selection. Please try again."
             return advisory_steps_screen(adv)
+
+        if level == 4 and inputs[3] == "2":
+            try:
+                adv = farm["advisories"][int(inputs[2]) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            return rate_advisory_screen(adv)
+
+        # Level 5 — feedback from detail rate screen (Path A)
+        if level == 5 and inputs[3] == "2" and inputs[4] in ("1", "2"):
+            try:
+                adv_index = int(inputs[2]) - 1
+                adv = farm["advisories"][adv_index]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            store_feedback(farm_key, adv_index, inputs[4], "immediate")
+            return feedback_received_screen(adv)
+
+        # Level 5 — immediate feedback from all-advisories action steps
+        if level == 5 and inputs[3] == "1" and inputs[4] in ("1", "2"):
+            try:
+                adv_index = int(inputs[2]) - 1
+                adv = farm["advisories"][adv_index]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            store_feedback(farm_key, adv_index, inputs[4], "immediate")
+            return feedback_received_screen(adv)
 
     # ---- Manage Crops branch (menu_choice == "2") --------------------------
 
@@ -525,7 +585,7 @@ def ussd_callback():
                 return "END Invalid selection. Please try again."
             return advisory_detail_screen(adv)
 
-        # Level 6 — action steps from crop-specific advisory detail
+        # Level 6 — action steps or rate screen from crop-specific advisory detail
         if level == 6 and inputs[3] == "2" and inputs[5] == "1":
             try:
                 crop_name = crops[int(crop_choice) - 1]
@@ -537,6 +597,75 @@ def ussd_callback():
             except (ValueError, IndexError):
                 return "END Invalid selection. Please try again."
             return advisory_steps_screen(adv)
+
+        if level == 6 and inputs[3] == "2" and inputs[5] == "2":
+            try:
+                crop_name = crops[int(crop_choice) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            matching = [a for a in farm["advisories"] if a["crop"] == crop_name]
+            try:
+                adv = matching[int(inputs[4]) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            return rate_advisory_screen(adv)
+
+        # Level 7 — feedback from detail rate screen (Path B)
+        if level == 7 and inputs[3] == "2" and inputs[5] == "2" and inputs[6] in ("1", "2"):
+            try:
+                crop_name = crops[int(crop_choice) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            matching = [a for a in farm["advisories"] if a["crop"] == crop_name]
+            try:
+                adv_index_in_matching = int(inputs[4]) - 1
+                adv = matching[adv_index_in_matching]
+                adv_index = farm["advisories"].index(adv)
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            store_feedback(farm_key, adv_index, inputs[6], "immediate")
+            return feedback_received_screen(adv)
+
+        # Level 7 — immediate feedback from crop-specific advisory action steps
+        if level == 7 and inputs[3] == "2" and inputs[5] == "1" and inputs[6] in ("1", "2"):
+            try:
+                crop_name = crops[int(crop_choice) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            matching = [a for a in farm["advisories"] if a["crop"] == crop_name]
+            try:
+                adv_index_in_matching = int(inputs[4]) - 1
+                adv = matching[adv_index_in_matching]
+                adv_index = farm["advisories"].index(adv)
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            store_feedback(farm_key, adv_index, inputs[6], "immediate")
+            return feedback_received_screen(adv)
+
+    # ---- Rate Past Advisories branch (menu_choice == "3") ------------------
+
+    elif menu_choice == "3":
+        # Level 2 — list all advisories to rate
+        if level == 2:
+            return advisories_list_screen(farm)
+
+        # Level 3 — show rating screen for selected advisory
+        if level == 3:
+            try:
+                adv = farm["advisories"][int(inputs[2]) - 1]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            return rate_advisory_screen(adv)
+
+        # Level 4 — record past feedback
+        if level == 4 and inputs[3] in ("1", "2"):
+            try:
+                adv_index = int(inputs[2]) - 1
+                adv = farm["advisories"][adv_index]
+            except (ValueError, IndexError):
+                return "END Invalid selection. Please try again."
+            store_feedback(farm_key, adv_index, inputs[3], "past")
+            return feedback_received_screen(adv)
 
     return "END Invalid option. Please try again."
 
