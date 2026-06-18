@@ -1,0 +1,7 @@
+The exercise is to take following columns for farm, crop, severity, threat , description, recommendation
+
+
+[FARM][CROP] [THREAT] - [SEVERITY]. [ACTION] [PRODUCT] [DOSE] [DAY/TIME]
+
+output - 160 characters Swahili. Try your best to fit it into 160 characters. If it goes beyond that break the output into 2 160 characters output respectively. Do not add additional text, just the exact SMS output, separated by newline. Only use alpha-numeric characters and punctuation.
+- always add [FARM][CROP] at the start of the message
